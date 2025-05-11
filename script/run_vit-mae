@@ -1,0 +1,173 @@
+# models/vit_mae.py
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+import os
+from utils.metrics import calculate_metrics, print_metrics_summary
+from utils.visualization import save_visualizations
+
+class ViT_MAE:
+    def __init__(self, input_shape=(23, 4), num_classes=7, model_dir="saved_models/vit_mae", mask_ratio=0.75):
+        self.input_shape = input_shape
+        self.num_classes = num_classes
+        self.model_dir = model_dir
+        self.mask_ratio = mask_ratio
+        os.makedirs(self.model_dir, exist_ok=True)
+        
+        # Build both encoder and decoder
+        self.encoder, self.decoder = self._build_mae()
+        self.classifier = self._add_classification_head()
+        self.encoder.trainable = False  # Freeze encoder during fine-tuning
+        
+    def _build_mae(self):
+        """Build MAE encoder-decoder architecture"""
+        # Encoder
+        inputs = layers.Input(shape=self.input_shape)
+        
+        # 1. Patch creation
+        patches = Patches(patch_size=4)(inputs)  # Output: (None, 6, 16)
+        num_patches = (self.input_shape[0] // 4) * (self.input_shape[1] // 1)
+        
+        # 2. Masking
+        mask_token = tf.Variable(tf.random.normal([1, 1, 64]), trainable=True)
+        masked_patches, unmasked_indices = self._random_masking(patches)
+        
+        # 3. Positional embeddings
+        positions = tf.range(start=0, limit=num_patches, delta=1)
+        pos_embed = layers.Embedding(input_dim=num_patches, output_dim=64)(positions)
+        
+        # 4. Encoder processing
+        encoded = layers.Dense(64)(masked_patches) + pos_embed
+        for _ in range(6):  # 6 transformer blocks
+            x = layers.LayerNormalization()(encoded)
+            x = layers.MultiHeadAttention(num_heads=4, key_dim=16)(x, x)
+            encoded = encoded + x
+            x = layers.LayerNormalization()(encoded)
+            x = layers.Dense(128, activation='gelu')(x)
+            encoded = encoded + x
+        
+        # Decoder
+        decoder_inputs = layers.Input(shape=(None, 64))  # For masked tokens
+        x = layers.Dense(128)(decoder_inputs) + pos_embed
+        for _ in range(2):  # Shallow decoder
+            x = layers.LayerNormalization()(x)
+            x = layers.MultiHeadAttention(num_heads=2, key_dim=16)(x, x)
+            x = layers.Dense(128, activation='gelu')(x)
+        
+        # Reconstruction output
+        reconstructed = layers.Dense(16)(x)  # 16 = patch_size(4)*features(4)
+        
+        return Model(inputs, encoded), Model(decoder_inputs, reconstructed)
+    
+    def _add_classification_head(self):
+        """Add classification head to encoder"""
+        inputs = layers.Input(shape=(None, 64))  # Encoder output shape
+        x = layers.GlobalAveragePooling1D()(inputs)
+        x = layers.Dense(128, activation='gelu')(x)
+        outputs = layers.Dense(self.num_classes, activation='softmax')(x)
+        return Model(inputs, outputs)
+    
+    def _random_masking(self, patches):
+        """Mask patches with ratio"""
+        batch_size = tf.shape(patches)[0]
+        num_patches = tf.shape(patches)[1]
+        
+        # Create mask
+        noise = tf.random.uniform((batch_size, num_patches))
+        mask = noise < self.mask_ratio
+        
+        # Replace masked patches with mask token
+        mask_tokens = tf.repeat(self.mask_token, tf.reduce_sum(tf.cast(mask, tf.int32)), axis=0)
+        masked_patches = tf.where(
+            tf.expand_dims(mask, -1),
+            mask_tokens,
+            patches
+        )
+        return masked_patches, tf.where(~mask)  # Return unmasked indices
+    
+    def pretrain(self, x_train, epochs=100, batch_size=256):
+        """Self-supervised pretraining"""
+        # Custom loss for reconstruction
+        def mae_loss(y_true, y_pred):
+            # Only compute loss on masked patches
+            mask = tf.cast(tf.not_equal(y_true, 0), tf.float32)
+            loss = tf.reduce_mean(tf.square(y_true - y_pred) * mask)
+            return loss
+        
+        # Compile
+        self.encoder.compile(
+            optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-4),
+            loss=mae_loss
+        )
+        
+        # Train (reconstruct input)
+        history = self.encoder.fit(
+            x_train, x_train,  # Autoencoder setup
+            batch_size=batch_size,
+            epochs=epochs,
+            callbacks=[tf.keras.callbacks.ModelCheckpoint(
+                os.path.join(self.model_dir, "pretrained_encoder.h5"),
+                save_best_only=True
+            )]
+        )
+        return history
+    
+    def finetune(self, x_train, y_train, x_val, y_val, epochs=50, batch_size=64):
+        """Supervised fine-tuning"""
+        # Encode labels
+        y_train_enc = self.encoder.fit_transform(y_train)
+        y_val_enc = self.encoder.transform(y_val)
+        
+        # Compile classifier
+        self.classifier.compile(
+            optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-5),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"]
+        )
+        
+        # Train
+        history = self.classifier.fit(
+            self.encoder.predict(x_train),
+            y_train_enc,
+            validation_data=(self.encoder.predict(x_val), y_val_enc),
+            batch_size=batch_size,
+            epochs=epochs,
+            callbacks=[tf.keras.callbacks.ModelCheckpoint(
+                os.path.join(self.model_dir, "finetuned_classifier.h5"),
+                save_best_only=True
+            )]
+        )
+        return history
+    
+    def evaluate(self, x_test, y_test):
+        """Evaluate performance"""
+        y_test_enc = self.encoder.transform(y_test)
+        x_test_encoded = self.encoder.predict(x_test)
+        y_pred = np.argmax(self.classifier.predict(x_test_encoded), axis=1)
+        
+        metrics = calculate_metrics(y_test_enc, y_pred, "ViT-MAE")
+        print_metrics_summary(metrics)
+        
+        save_visualizations(
+            model=self.classifier,
+            x_data=x_test_encoded,
+            y_true=y_test_enc,
+            y_pred=y_pred,
+            model_name="ViT-MAE"
+        )
+        return metrics
+
+# Helper Layers (same as previous ViT implementation)
+class Patches(layers.Layer):
+    def __init__(self, patch_size):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def call(self, x):
+        batch_size = tf.shape(x)[0]
+        # Reshape into patches
+        patches = tf.reshape(
+            x,
+            [batch_size, -1, self.patch_size * x.shape[-1]]
+        )
+        return patches
