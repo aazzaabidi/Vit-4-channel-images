@@ -6,23 +6,18 @@
 - **Model Zoo**:
   - Vision Transformer (ViT)
   - Swin Transformer 
-  - ResNet-Transformer hybrids
-- **Training**:
-  - Automatic mixed precision
-  - Distributed training support
-  - Hyperparameter tuning
+  - ResNet-50
+  - TempCNN
+  - RandomForest
+  - Encodeep
+    
+
 - **Evaluation**:
   - Standard metrics (Accuracy, F1, Cohen's Kappa)
   - UMAP/T-SNE visualizations
   - Confusion matrices
 
-## Installation
 
-```bash
-git clone https://github.com/yourusername/time-series-transformers.git
-cd time-series-transformers
-pip install -r requirements.txt
-```
 
 ## Data Preparation
 
