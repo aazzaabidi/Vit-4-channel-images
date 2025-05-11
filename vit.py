@@ -1,217 +1,251 @@
-import os
-from keras import layers
-from keras import ops
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+import math
 import numpy as np
+from torchsummary import summary
 import matplotlib.pyplot as plt
+from utils.metrics import calculate_metrics, plot_confusion_matrix
+from utils.visualization import plot_training_history
 
-import seaborn as sns
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-import tensorflow as tf
-from tensorflow import keras
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-train_data_path = ""
-train_labels_path = ""
-valid_data_path = ""
-valid_labels_path = ""
-test_data_path = ""
-test_labels_path = ""
-
-# Load the NumPy files
-x_train = np.load(train_data_path)
-y_train = np.load(train_labels_path)
-x_valid = np.load(valid_data_path)
-y_valid = np.load(valid_labels_path)
-x_test = np.load(test_data_path)
-y_test = np.load(test_labels_path)
-
-# Print dataset shapes
-print(f"x_train shape: {x_train.shape} - y_train shape: {y_train.shape}")
-print(f"x_valid shape: {x_valid.shape} - y_valid shape: {y_valid.shape}")
-print(f"x_test shape: {x_test.shape} - y_test shape: {y_test.shape}")
-
-num_classes = len(np.unique(train_y))
-input_shape = train_x.shape[1:]
-patch_size = 4  
-num_patches = (input_shape[0] // patch_size) ** 2
-projection_dim = 64
-num_heads = 4
-transformer_layers = 6
-transformer_units = [projection_dim * 2, projection_dim]
-mlp_head_units = [128, 64]  # Dense layers pour la classification
-
-print(f"train_x shape: {train_x.shape} - train_y shape: {train_y.shape}")
-print(f"Nombre de classes: {num_classes}")
-
-
-unique_values = np.unique(train_y)
-print(unique_values)
-
-class Patches(layers.Layer):
-    def __init__(self, patch_size):
+class PatchEmbedding(nn.Module):
+    def __init__(self, seq_length=23, patch_size=1, in_channels=4, embed_dim=64):
         super().__init__()
+        self.seq_length = seq_length
         self.patch_size = patch_size
+        self.num_patches = (seq_length // patch_size)
+        
+        self.proj = nn.Linear(patch_size * in_channels, embed_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, embed_dim))
+    
+    def forward(self, x):
+        batch_size = x.shape[0]
+        x = x.unfold(1, self.patch_size, self.patch_size)
+        x = x.permute(0, 1, 3, 2).contiguous()
+        x = x.view(batch_size, self.num_patches, -1)
+        x = self.proj(x)
+        
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        
+        return x
 
-    def call(self, images):
-        batch_size = tf.shape(images)[0]
-        patches = tf.image.extract_patches(
-            images=images,
-            sizes=[1, self.patch_size, self.patch_size, 1],
-            strides=[1, self.patch_size, self.patch_size, 1],
-            rates=[1, 1, 1, 1],
-            padding="VALID",
-        )
-        return tf.reshape(patches, [batch_size, -1, self.patch_size * self.patch_size * input_shape[-1]])
-
-#MLP
-def mlp(x, hidden_units, dropout_rate):
-    for units in hidden_units:
-        x = layers.Dense(units, activation=keras.activations.gelu)(x)
-        x = layers.Dropout(dropout_rate)(x)
-    return x
-
-#batch creation as layer
-class Patches(layers.Layer):
-    def __init__(self, patch_size):
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim=64, num_heads=8, dropout=0.1):
         super().__init__()
-        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        batch_size, seq_length, embed_dim = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(batch_size, seq_length, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+        
+        x = (attn_probs @ v).transpose(1, 2).reshape(batch_size, seq_length, embed_dim)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+        
+        return x
 
-    def call(self, images):
-        input_shape = ops.shape(images)
-        batch_size = input_shape[0]
-        height = input_shape[1]
-        width = input_shape[2]
-        channels = input_shape[3]
-        num_patches_h = height // self.patch_size
-        num_patches_w = width // self.patch_size
-        patches = keras.ops.image.extract_patches(images, size=self.patch_size)
-        patches = ops.reshape(
-            patches,
-            (
-                batch_size,
-                num_patches_h * num_patches_w,
-                self.patch_size * self.patch_size * channels,
-            ),
-        )
-        return patches
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"patch_size": self.patch_size})
-        return config
-# patch encoding layer
-
-
-class PatchEncoder(layers.Layer):
-    def __init__(self, num_patches, projection_dim):
+class TransformerEncoderBlock(nn.Module):
+    def __init__(self, embed_dim=64, num_heads=8, mlp_ratio=4, dropout=0.1):
         super().__init__()
-        self.num_patches = num_patches
-        self.projection = layers.Dense(units=projection_dim)
-        self.position_embedding = layers.Embedding(
-            input_dim=num_patches, output_dim=projection_dim
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        
+        mlp_hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, embed_dim),
+            nn.Dropout(dropout)
         )
+    
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-    def call(self, patch):
-        positions = ops.expand_dims(
-            ops.arange(start=0, stop=self.num_patches, step=1), axis=0
-        )
-        projected_patches = self.projection(patch)
-        encoded = projected_patches + self.position_embedding(positions)
-        return encoded
+class VisionTransformer(nn.Module):
+    def __init__(self, seq_length=23, patch_size=1, in_channels=4, 
+                 embed_dim=64, depth=6, num_heads=8, mlp_ratio=4, 
+                 dropout=0.1, num_classes=1):
+        super().__init__()
+        self.patch_embed = PatchEmbedding(seq_length, patch_size, in_channels, embed_dim)
+        self.blocks = nn.ModuleList([
+            TransformerEncoderBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+    
+    def forward(self, x):
+        x = self.patch_embed(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        cls_token = x[:, 0]
+        x = self.head(cls_token)
+        return x
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({"num_patches": self.num_patches})
-        return config
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return torch.tensor(self.data[idx], dtype=torch.float32), torch.tensor(self.labels[idx], dtype=torch.float32)
 
-  #model building
-def create_vit_classifier():
-    inputs = keras.Input(shape=input_shape)
-    # Create patches.
-    patches = Patches(patch_size)(inputs)
-    # Encode patches.
-    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+def train_model(model, train_loader, val_loader, test_loader, criterion, optimizer, num_epochs):
+    train_losses = []
+    val_losses = []
+    val_metrics = []
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        running_loss = 0.0
+        
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs).squeeze()
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * inputs.size(0)
+        
+        epoch_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(epoch_loss)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs).squeeze()
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item() * inputs.size(0)
+                preds = torch.sigmoid(outputs) > 0.5
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
+        
+        # Calculate metrics using your framework's function
+        metrics = calculate_metrics(all_labels, all_preds)
+        val_metrics.append(metrics)
+        
+        print(f'Epoch {epoch+1}/{num_epochs}')
+        print(f'Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}')
+        print(f'Validation Metrics: {metrics}')
+    
+    # Final evaluation on test set
+    test_preds, test_labels = evaluate_model(model, test_loader)
+    test_metrics = calculate_metrics(test_labels, test_preds)
+    
+    # Visualization
+    plot_training_history(train_losses, val_losses, val_metrics)
+    plot_confusion_matrix(test_labels, test_preds)
+    
+    return model, test_metrics
 
-    # Create multiple layers of the Transformer block.
-    for _ in range(transformer_layers):
-        # Layer normalization 1.
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        # Create a multi-head attention layer.
-        attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
-        )(x1, x1)
-        # Skip connection 1.
-        x2 = layers.Add()([attention_output, encoded_patches])
-        # Layer normalization 2.
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        # MLP.
-        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
-        # Skip connection 2.
-        encoded_patches = layers.Add()([x3, x2])
+def evaluate_model(model, loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs).squeeze()
+            preds = torch.sigmoid(outputs) > 0.5
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    return all_preds, all_labels
 
-    # Create a [batch_size, projection_dim] tensor.
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    representation = layers.Flatten()(representation)
-    representation = layers.Dropout(0.5)(representation)
-    # Add MLP.
-    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
-    # Classify outputs.
-    logits = layers.Dense(num_classes)(features)
-    # Create the Keras model.
-    model = keras.Model(inputs=inputs, outputs=logits)
-    return model
-def run_experiment(model):
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=1e-4, weight_decay=1e-3
-    )
-
-    model.compile(
+def main():
+    # Load your data
+    # X_train, y_train, X_val, y_val, X_test, y_test = load_your_data()
+    
+    # Example with random data (replace with your actual data)
+    X_train = np.random.randn(268410, 23, 4)  # 80% of 335513
+    y_train = np.random.randint(0, 2, (268410,))
+    X_val = np.random.randn(33551, 23, 4)  # 10%
+    y_val = np.random.randint(0, 2, (33551,))
+    X_test = np.random.randn(33552, 23, 4)  # 10%
+    y_test = np.random.randint(0, 2, (33552,))
+    
+    # Create datasets
+    train_dataset = TimeSeriesDataset(X_train, y_train)
+    val_dataset = TimeSeriesDataset(X_val, y_val)
+    test_dataset = TimeSeriesDataset(X_test, y_test)
+    
+    # Create dataloaders
+    batch_size = 256
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # Initialize model
+    model = VisionTransformer(
+        seq_length=23,
+        patch_size=1,
+        in_channels=4,
+        embed_dim=64,
+        depth=6,
+        num_heads=8,
+        num_classes=1
+    ).to(device)
+    
+    # Loss and optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+    
+    # Train the model
+    trained_model, test_metrics = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        criterion=criterion,
         optimizer=optimizer,
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
+        num_epochs=20
     )
+    
+    print(f'\nFinal Test Metrics: {test_metrics}')
+    torch.save(trained_model.state_dict(), 'vit_timeseries_model.pth')
 
-    checkpoint_filepath = "/tmp/checkpoint.weights.h5"
-    checkpoint_callback = keras.callbacks.ModelCheckpoint(
-        checkpoint_filepath,
-        monitor="val_accuracy",
-        save_best_only=True,
-        save_weights_only=True,
-    )
-
-    history = model.fit(
-        x=train_x,
-        y=train_y,
-        batch_size=16,
-        epochs=300,
-        validation_data=(valid_x, valid_y), 
-        callbacks=[checkpoint_callback],
-    )
-
-    model.load_weights(checkpoint_filepath)
-
-    y_pred = np.argmax(model.predict(test_x), axis=1)
-
-    # Compute Accuracy
-    accuracy = accuracy_score(test_y, y_pred)
-    print(f"Test Accuracy: {round(accuracy * 100, 2)}%")
-
-    # Compute F1-score
-    f1 = f1_score(test_y, y_pred, average="macro")
-    print(f"Test F1-score (macro): {round(f1, 4)}")
-
-    # Compute Confusion Matrix
-    conf_matrix = confusion_matrix(test_y, y_pred)
-
-    plt.figure(figsize=(10, 6))
-    sns.heatmap(conf_matrix, annot=True, cmap="Blues", fmt="d")
-    plt.xlabel("Predicted Labels")
-    plt.ylabel("True Labels")
-    plt.title("Confusion Matrix")
-    plt.show()
-
-    return history
-
-# Make sure create_vit_classifier() is defined
-vit_classifier = create_vit_classifier()
-history = run_experiment(vit_classifier)
+if __name__ == "__main__":
+    main()
